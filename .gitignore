@@ -1,0 +1,8 @@
+.ipynb_checkpoints/
+__pycache__/
+data/
+processed_races/
+f1_cache/
+*.pth
+*.pkl
+.DS_Store
