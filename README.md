@@ -5,124 +5,74 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ssarann/f1-pit-strategy/blob/main/notebooks/f1_pit_strategy.ipynb)
 
-A multi-task neural network made with PyTorch that predicts, lap by lap, whether a Formula 1 driver will pit and which tyre compound they will switch to. It is trained on eight seasons (2018–2025) of lap-level timing data from [FastF1](https://github.com/theOehrly/Fast-F1) and evaluated on held-out races.
+For every lap of a Formula 1 race, the model predicts **whether a driver will pit** and **which tyre compound they will fit**. It is trained on lap timing data from 2019–2023 ([FastF1](https://github.com/theOehrly/Fast-F1)), tuned on 2024 and tested on the full **2025 season**, which it never saw during training.
 
-The focus of the project is not only the model but also an evaluation of race-level data splitting and features that only use information available at the start of a lap.
+<p align="center">
+  <img src="docs/img/race_replay.png" alt="Pit probability over a 2025 race" width="750">
+</p>
 
----
+*Pit probability for three drivers in a 2025 test race. Black lines are real stops, orange markers are the laps where the model calls a stop.*
 
 ## Results
 
-| Task | Metric | Result |
-|---|---|---|
-| Pit timing | Window precision / recall / F1 | **42.9 % / 64.0 % / 0.513** |
-| Tyre compound at an actual stop | 6-class accuracy | **52.5 %** (always predicting HARD: 42.2 %) |
+Test season 2025: 24 races, 705 pit stops. A call counts as correct if it is within 2 laps of a real stop.
 
-Window-level counts on the test races: 710 true positives, 946 false alarms, 400 missed stops. All numbers come from races the model never saw during training. See [Limitations](#limitations).
+| Model | Precision | Recall | F1 | Tyre choice accuracy |
+|---|---:|---:|---:|---:|
+| Rule: pit at the usual stint length | 20.4 % | 14.9 % | 0.17 | 56.1 % |
+| Neural network, basic inputs only | 31.6 % | 46.2 % | 0.38 | 59.0 % |
+| LightGBM | 37.1 % | 51.6 % | 0.43 | 67.1 % |
+| Neural network | 34.1 % | 55.2 % | 0.42 | 69.9 % |
+| **Neural network + LightGBM** | **40.6 %** | **53.9 %** | **0.46** | **70.3 %** |
 
----
+Only 2.7 % of laps are pit laps, so random guessing would reach a precision of about 3 %.
 
-## Problem
+<p align="center">
+  <img src="docs/img/model_comparison.png" alt="Precision-recall curves, calibration and F1 by timing tolerance" width="850">
+</p>
 
-During a race, a team decides each lap whether to bring the driver in and which tyres to fit. This project asks how much of that decision can be predicted from the driver's own lap history alone:
+## How it works
 
-1. **Pit head** – binary classification: is this lap a pit lap?
-2. **Compound head** – 6-class classification: which compound is fitted next (`SOFT`, `MEDIUM`, `HARD`, `INTERMEDIATE`, `WET`, `NONE`)?
+**Data.** One CSV per race with every lap of every driver. Cleaning steps:
+- 2018 used absolute compound names (hypersoft to superhard). They are ranked within each race and renamed Soft, Medium and Hard, like in later seasons.
+- Pit entries that are not tyre stops are removed: retirements, drive-through penalties and safety-car laps routed through the pit lane.
 
-Both tasks share one representation, so the network learns tyre-wear and race-phase features once and uses them for both outputs.
+**Features.** Everything is computed from laps that are already finished, so the model never uses information from the future:
 
-## Data
-Timing data are accessed through the open-source [FastF1](https://github.com/theOehrly/Fast-F1) library.
-- **Source:** FastF1, seasons 2018–2025, roughly 170 Grands Prix and about 180k laps.
-- **Sample:** one driver lap, described by a 15-dimensional feature vector.
-- **Features (15):**
-  - *Race context:* lap number, race progress, laps remaining, previous-lap position
-  - *Tyres:* current compound, tyre life, stint length
-  - *Pace:* previous-lap time, degradation proxy (previous-lap time minus the stint's best lap so far)
-  - *Track conditions:* safety-car flag, virtual-safety-car flag, air temperature, track temperature, rainfall
-- **Targets:** `PitThisLap` (binary) and the compound of the following lap (6 classes). On a pit lap this is the newly fitted compound. `NONE` marks an unknown compound or a driver with no following lap, for example a retirement in the pits.
-
-Raw data are downloaded on the first run and cached locally; they are not stored in this repository.
-
-## Model
-
-| Component | Setting |
+| Group | Examples |
 |---|---|
-| Backbone | 256 → 128 → 64, ReLU, dropout 0.3 / 0.2 |
-| Pit loss | Weighted binary cross-entropy, `pos_weight = 60` |
-| Compound loss | Masked cross-entropy (only pit laps contribute), weight λ = 3.0 |
-| Optimiser | Adam, lr = 7·10⁻⁴ |
-| Scheduler | `ReduceLROnPlateau` (factor 0.5, patience 5) |
-| Training | 150 epochs, seed 42 |
-| Decision threshold | 0.75 |
+| Tyres | tyre age, compound, compounds used so far, whether a second dry compound is still required |
+| Pace | lap-time loss compared to the best lap of the stint, how fast that loss is growing |
+| Rivals | gaps to the cars ahead and behind, whether they just pitted, how many cars have already stopped |
+| Race status | safety car or virtual safety car, laps remaining |
+| Weather | rain, lap-time difference between cars on intermediates and on slicks |
+| Circuit history | usual stint length and pit-lane time loss at this circuit in earlier seasons |
 
-## Results
+**Model.** A neural network (PyTorch) with two outputs: the probability of a stop on this lap and the next tyre compound. Five copies are trained with different random seeds and averaged, then combined with a LightGBM model trained on the same features.
 
-### Training
+**Evaluation.** Seasons are split by year (train 2019–2023, validation 2024, test 2025). Early stopping and the decision threshold are chosen on 2024 only, so the 2025 numbers are a clean estimate.
 
-<p align="center">
-  <img src="docs/img/training_curves.png" alt="Training loss and learning-rate schedule" width="600">
-</p>
-
-The combined training loss falls from about 4.9 to 2.2 over 150 epochs while the scheduler halves the learning rate six times. The curve shows training loss only; the project does not yet track a validation curve (see [Limitations](#limitations)).
-
-### Tyre compound at the moment of a stop
+## Tyre choice
 
 <p align="center">
-  <img src="docs/img/compound_confusion_matrix.png" alt="Compound confusion matrix" width="600">
+  <img src="docs/img/compound_prediction.png" alt="Confusion matrix for the next compound" width="750">
 </p>
 
-*Figure: rows are the actual compound, columns the predicted one.*
-
-Of 1,118 actual stops in the test races, 587 are classified correctly (52.5 %). The model beats the majority-class baseline of always predicting `HARD` (42.2 %). Per-class recall:
-
-| Actual compound | Stops | Recall |
-|---|---:|---:|
-| HARD | 472 | 62.5 % |
-| MEDIUM | 311 | 47.6 % |
-| SOFT | 240 | 41.3 % |
-| INTERMEDIATE | 47 | 74.5 % |
-| NONE | 44 | 22.7 % |
-| WET | 4 | 0 % |
-
-Most errors are confusions between the three dry compounds, mainly `HARD` ↔ `MEDIUM`. `NONE` and `WET` have very few examples, so their numbers are not reliable.
-
-### Example: a held-out race
-
-<p align="center">
-  <img src="docs/img/race_example_gas_china_2018.png" alt="Pit probability over a race" width="650">
-</p>
-
-*Driver GAS, 2018 Chinese Grand Prix (test set). Blue: predicted pit probability; red dots: actual stops; dashed line: decision threshold 0.75.*
-
-Both real stops (laps 20 and 31) lie in a region where the model is confident, so the stint structure is captured. The plot also shows the main weakness: the probability stays above the threshold for many consecutive laps, producing a broad alarm region instead of a sharp peak at the stop.
+The biggest single improvement came from knowing which compounds the rest of the field has switched to in the same race. Most errors are between the three dry compounds.
 
 ## Limitations
 
-- **Uncalibrated probabilities.** The large `pos_weight` inflates raw outputs, so the values are scores, not true likelihoods.
-- **Threshold chosen manually.** 0.75 was fixed by hand and not tuned on a separate validation split, so test metrics may be mildly optimistic.
-- **Limited information.** The model sees the driver's own lap history, coarse weather and safety-car flags, but not gaps to other cars, traffic, tyre-set availability or team strategy. These trigger many real stops, which sets a ceiling on achievable accuracy.
-- **Safety-car flags are not strictly causal.** `IsSafetyCar` and `IsVSC` are derived from the track status of the *current* lap, which is only fully known at the end of that lap. They can therefore carry information that a real-time system would not have at decision time.
-- **Single run.** One seed and one split, so there are no confidence intervals.
-- **Small classes.** `WET` and `NONE` have too few test examples for stable estimates.
+- About 60 % of the calls are false alarms, mostly a few laps before the real stop. The model sees that the pit window is open but often not the exact lap.
+- Stops caused by damage or a sudden safety car cannot be predicted from lap data.
+- The model sees the safety car status of the current lap as race control shows it live. Without it, the results are lower.
+- Tyre sets left for the race and team radio are not in the data.
 
-## Future work
+## Running the notebook
 
-- Select the threshold on a validation split and add a validation loss curve with early stopping.
-- Post-processing: keep only the highest-probability lap in each cluster of consecutive alarms.
-- Reformulate the target as "pit within the next *k* laps", which matches the ±2-lap strategic metric better.
-- Grouped k-fold cross-validation by race for confidence intervals.
+1. Click the **Open in Colab** badge, choose a GPU runtime and run all cells.
+2. On the first run the notebook downloads about 170 races through FastF1 into Google Drive. The API allows about 500 requests per hour, so the download may need to be resumed. Later runs take about 5 minutes.
 
-## Reproducing the results
-
-The notebook is written for **Google Colab**: it mounts Google Drive to cache the FastF1 downloads and the processed race files.
-
-1. Click the *Open in Colab* badge at the top.
-2. Run all cells from the top and allow the Drive mount.
-
-The first run downloads about 170 races through FastF1 (the API has an hourly request limit, so it may need to be resumed) and takes a while. Processed races are checkpointed to Drive. A GPU is optional.
-
-To run locally, remove the `google.colab` import and the `drive.mount` call, point `BASE_DIR` to a local folder and install the dependencies:
+To run it locally, set `F1_PROJECT_DIR` to a folder for the data and install the dependencies:
 
 ```bash
 git clone https://github.com/ssarann/f1-pit-strategy.git
@@ -136,7 +86,7 @@ jupyter notebook notebooks/f1_pit_strategy.ipynb
 ```
 f1-pit-strategy/
 ├── notebooks/
-│   └── f1_pit_strategy.ipynb   # data processing, training, evaluation
+│   └── f1_pit_strategy.ipynb   # data, features, training, evaluation
 ├── docs/img/                   # figures used in this README
 ├── requirements.txt
 ├── LICENSE
@@ -145,4 +95,4 @@ f1-pit-strategy/
 
 ## License
 
-Released under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE). Timing data from [FastF1](https://github.com/theOehrly/Fast-F1). This project is not affiliated with Formula 1 or the FIA.
